@@ -38,6 +38,18 @@ def cast_if_autocast_enabled(tensor):
             raise RuntimeError('User specified autocast device_type must be \'cuda\' or \'cpu\'')
         return tensor.to(dtype=dtype)
 
+def generate_scatter_index(splits, num_tokens, topk):
+
+    # generate choosed experts
+    choosed_experts = torch.zeros((num_tokens, topk), dtype=torch.int64)
+    bin_counter = torch.clone(splits)
+    offsets = torch.cumsum(splits, dim=0) - splits
+    for tid in range(num_tokens):
+        bin_size, bins = torch.topk(bin_counter, topk)
+        choosed_experts[tid] = bins
+        bin_counter[bins] -= 1
+
+    return choosed_experts
 
 class MOELayer(torch.nn.Module):
     """Tutel optimized MOELayer
@@ -219,6 +231,21 @@ class MOELayer(torch.nn.Module):
         if seeds is not None and len(seeds) > 2 and seeds[2] is not None:
             torch.manual_seed(seeds[2])
 
+        seq_length = int(os.environ.get("SEQ_LEN", 16384))
+        test_type = os.environ.get("TEST_TYPE", "e2e")
+        top_k = int(os.environ.get("TOPK", 2))
+        if test_type == "e2e":
+            tp_size = int(os.environ.get("TP_SIZE", 8))
+        else:
+            tp_size = 8
+        WORLD_SIZE = 8
+        token_per_rank = seq_length // tp_size
+        token_per_expert = token_per_rank * top_k * WORLD_SIZE // self.num_global_experts
+        self.splits_cpu = torch.tensor([token_per_expert] * self.num_global_experts, dtype=torch.int32)
+        self.choosed_experts_all_token = generate_scatter_index(self.splits_cpu, token_per_rank * WORLD_SIZE, top_k)
+        RANK = torch.distributed.get_rank()
+        self.indices = self.choosed_experts_all_token[RANK * token_per_rank : (RANK+1) * token_per_rank].to(torch.long).cuda()
+
     def extra_repr(self):
         return 'Top-K(s) = %s, Total-Experts = %d [managed by %d device(s)],' % (
             [f'k={x.top_k}, noise={x.gate_noise}' for x in self.gates],
@@ -284,7 +311,7 @@ class MOELayer(torch.nn.Module):
 
             mega_up = max(megablocks_size, 1)
 
-            return logits.dtype, extract_critical(scores,
+            return logits.dtype, extract_critical(self.indices, scores,
                 top_k = top_k,
                 loss_fn = _loss_fn,
                 capacity_factor = capacity_factor or gctx.capacity_factor,
@@ -336,7 +363,7 @@ class MOELayer(torch.nn.Module):
                 else:
                     y = y.view(self.num_global_experts, -1, y.size(2))
 
-        y = fast_decode(y.to(logits_dtype), crit, self.is_postscore)
+        y = fast_decode(y.to(logits_dtype), crit, False)
 
         y = y.view(list(original_shape[:-reserve_dims]) + list(self.protected_shape[-reserve_dims:])).to(original_dtype)
         self.l_aux = y.l_aux = l_aux

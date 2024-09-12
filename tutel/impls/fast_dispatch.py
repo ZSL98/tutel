@@ -140,10 +140,11 @@ def compute_sorted_location(x, importance_scores):
     sorted_cumsum = fast_cumsum_sub_one(sorted_x) * sorted_x
     return sorted_cumsum[importance_scores.argsort(dim=0).argsort(dim=0)]
 
-def extract_critical(scores, top_k, loss_fn=losses.gshard_loss, capacity_factor=1.0, batch_prioritized_routing=False, normalize_gate=True, alignment=1, group=None, inequivalent_tokens=False):
+def extract_critical(indices, scores, top_k, loss_fn=losses.gshard_loss, capacity_factor=1.0, batch_prioritized_routing=False, normalize_gate=True, alignment=1, group=None, inequivalent_tokens=False):
     num_global_experts = int(scores.size(1))
     top_k, top_k_original = min(top_k, num_global_experts), top_k
     topk_indices = torch.topk(scores, top_k, dim=1).indices
+    topk_indices = indices
 
     indices_s = [x.view(-1) for x in topk_indices.chunk(top_k, dim=1)]
 
